@@ -1,0 +1,114 @@
+version: '3.8'
+
+# ============================================================
+# HN ETL — Local Airflow Development Stack
+# ============================================================
+# Usage:
+#   docker compose up -d
+#   open http://localhost:8080  (admin / admin)
+#
+# AWS credentials are passed via environment variables.
+# For local S3 testing, LocalStack is included.
+# ============================================================
+
+x-airflow-common: &airflow-common
+  image: apache/airflow:2.9.1-python3.11
+  environment: &airflow-env
+    AIRFLOW__CORE__EXECUTOR: LocalExecutor
+    AIRFLOW__DATABASE__SQL_ALCHEMY_CONN: postgresql+psycopg2://airflow:airflow@postgres/airflow
+    AIRFLOW__CORE__FERNET_KEY: ''
+    AIRFLOW__CORE__DAGS_ARE_PAUSED_AT_CREATION: 'true'
+    AIRFLOW__CORE__LOAD_EXAMPLES: 'false'
+    AIRFLOW__API__AUTH_BACKENDS: 'airflow.api.auth.backend.basic_auth'
+    AIRFLOW__SCHEDULER__ENABLE_HEALTH_CHECK: 'true'
+    # HN ETL Variables
+    AIRFLOW_VAR_HN_S3_BUCKET: hn-data-lake
+    AIRFLOW_VAR_HN_S3_PREFIX: raw/stories
+    AIRFLOW_VAR_HN_GLUE_CRAWLER: hn-stories-crawler
+    AIRFLOW_VAR_HN_AWS_REGION: us-east-1
+    AIRFLOW_VAR_HN_TOP_N: '200'
+    # AWS credentials (override with real values or use IAM role on EC2/MWAA)
+    AWS_ACCESS_KEY_ID: ${AWS_ACCESS_KEY_ID:-test}
+    AWS_SECRET_ACCESS_KEY: ${AWS_SECRET_ACCESS_KEY:-test}
+    AWS_DEFAULT_REGION: ${AWS_DEFAULT_REGION:-us-east-1}
+    # Point boto3 at LocalStack for local dev
+    AWS_ENDPOINT_URL: http://localstack:4566
+  volumes:
+    - ./dags:/opt/airflow/dags
+    - ./scripts:/opt/airflow/scripts
+    - ./logs:/opt/airflow/logs
+    - ./plugins:/opt/airflow/plugins
+  depends_on:
+    postgres:
+      condition: service_healthy
+
+services:
+  postgres:
+    image: postgres:15
+    environment:
+      POSTGRES_USER: airflow
+      POSTGRES_PASSWORD: airflow
+      POSTGRES_DB: airflow
+    volumes:
+      - postgres-db-volume:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD", "pg_isready", "-U", "airflow"]
+      interval: 10s
+      retries: 5
+      start_period: 5s
+
+  airflow-webserver:
+    <<: *airflow-common
+    command: webserver
+    ports:
+      - "8085:8080"   # mapped to 8085 to avoid conflict with ARIA on 8080
+    healthcheck:
+      test: ["CMD", "curl", "--fail", "http://localhost:8080/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 30s
+
+  airflow-scheduler:
+    <<: *airflow-common
+    command: scheduler
+    healthcheck:
+      test: ["CMD", "curl", "--fail", "http://localhost:8974/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 30s
+
+  airflow-init:
+    <<: *airflow-common
+    entrypoint: /bin/bash
+    command:
+      - -c
+      - |
+        airflow db migrate
+        airflow users create \
+          --username admin \
+          --firstname Rosalina \
+          --lastname Torres \
+          --role Admin \
+          --email torres.ros@northeastern.edu \
+          --password admin
+    environment:
+      <<: *airflow-env
+
+  # LocalStack: emulates S3, Glue, Athena locally
+  localstack:
+    image: localstack/localstack:3.4
+    ports:
+      - "4566:4566"
+    environment:
+      SERVICES: s3,glue,athena,iam,logs
+      DEBUG: 0
+      DATA_DIR: /var/lib/localstack/data
+    volumes:
+      - localstack-data:/var/lib/localstack
+      - /var/run/docker.sock:/var/run/docker.sock
+
+volumes:
+  postgres-db-volume:
+  localstack-data:

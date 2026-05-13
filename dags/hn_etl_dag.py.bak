@@ -1,0 +1,304 @@
+"""
+Hacker News ETL Pipeline
+========================
+Extracts top stories from the HN Firebase API, loads nested JSON
+to S3 (partitioned by date), triggers AWS Glue crawler, and logs
+metadata to a run manifest table in S3.
+
+Schedule: Daily at 06:00 UTC
+"""
+
+from __future__ import annotations
+
+import json
+import logging
+import os
+from datetime import datetime, timedelta
+
+from airflow import DAG
+from airflow.models import Variable
+from airflow.operators.python import PythonOperator
+from airflow.operators.empty import EmptyOperator
+from airflow.utils.dates import days_ago
+
+# ---------------------------------------------------------------------------
+# Default args
+# ---------------------------------------------------------------------------
+DEFAULT_ARGS = {
+    "owner": "rosalina",
+    "depends_on_past": False,
+    "email_on_failure": True,
+    "email": ["torres.ros@northeastern.edu"],
+    "retries": 3,
+    "retry_delay": timedelta(minutes=5),
+}
+
+# ---------------------------------------------------------------------------
+# Config — set these as Airflow Variables or environment variables
+# ---------------------------------------------------------------------------
+S3_BUCKET       = Variable.get("HN_S3_BUCKET",       default_var="hn-data-lake")
+S3_PREFIX       = Variable.get("HN_S3_PREFIX",        default_var="raw/stories")
+GLUE_CRAWLER    = Variable.get("HN_GLUE_CRAWLER",     default_var="hn-stories-crawler")
+AWS_REGION      = Variable.get("HN_AWS_REGION",       default_var="us-east-1")
+TOP_N_STORIES   = int(Variable.get("HN_TOP_N",        default_var="200"))
+
+log = logging.getLogger(__name__)
+
+# ---------------------------------------------------------------------------
+# Task functions
+# ---------------------------------------------------------------------------
+
+def extract_story_ids(**context) -> list[int]:
+    """Fetch top story IDs from HN Firebase API."""
+    import requests
+
+    url = "https://hacker-news.firebaseio.com/v0/topstories.json"
+    resp = requests.get(url, timeout=30)
+    resp.raise_for_status()
+
+    ids = resp.json()[:TOP_N_STORIES]
+    log.info("Fetched %d story IDs", len(ids))
+
+    context["task_instance"].xcom_push(key="story_ids", value=ids)
+    return ids
+
+
+def extract_stories(**context) -> list[dict]:
+    """Fetch full story objects for each ID (with comments count + kids)."""
+    import requests
+    from concurrent.futures import ThreadPoolExecutor, as_completed
+
+    ids: list[int] = context["task_instance"].xcom_pull(
+        key="story_ids", task_ids="extract_story_ids"
+    )
+
+    def fetch_item(item_id: int) -> dict | None:
+        url = f"https://hacker-news.firebaseio.com/v0/item/{item_id}.json"
+        try:
+            r = requests.get(url, timeout=10)
+            r.raise_for_status()
+            return r.json()
+        except Exception as exc:
+            log.warning("Failed to fetch item %s: %s", item_id, exc)
+            return None
+
+    stories = []
+    with ThreadPoolExecutor(max_workers=20) as executor:
+        futures = {executor.submit(fetch_item, sid): sid for sid in ids}
+        for future in as_completed(futures):
+            result = future.result()
+            if result:
+                stories.append(result)
+
+    log.info("Extracted %d stories", len(stories))
+    context["task_instance"].xcom_push(key="stories", value=stories)
+    return stories
+
+
+def transform_stories(**context) -> list[dict]:
+    """
+    Flatten and enrich story objects:
+    - Add extraction metadata (run_date, run_ts)
+    - Normalize nullable fields
+    - Count kids (top-level comments)
+    - Sanitize text fields
+    """
+    from datetime import timezone
+
+    stories: list[dict] = context["task_instance"].xcom_pull(
+        key="stories", task_ids="extract_stories"
+    )
+
+    run_date = context["ds"]  # YYYY-MM-DD
+    run_ts   = datetime.now(timezone.utc).isoformat()
+
+    transformed = []
+    for s in stories:
+        if not s or s.get("type") != "story":
+            continue
+
+        transformed.append({
+            # Core fields
+            "id":           s.get("id"),
+            "title":        (s.get("title") or "").strip(),
+            "url":          s.get("url", ""),
+            "domain":       _extract_domain(s.get("url", "")),
+            "by":           s.get("by", ""),
+            "score":        s.get("score", 0),
+            "descendants":  s.get("descendants", 0),  # total comment tree count
+            "kids_count":   len(s.get("kids") or []),  # direct replies only
+            "kids":         s.get("kids") or [],        # kept for downstream joins
+            "text":         (s.get("text") or "").strip(),  # Ask HN body text
+            "time":         s.get("time"),              # Unix epoch
+            "type":         s.get("type", "story"),
+            # Partition / audit fields
+            "run_date":     run_date,
+            "run_ts":       run_ts,
+        })
+
+    log.info("Transformed %d valid stories", len(transformed))
+    context["task_instance"].xcom_push(key="transformed", value=transformed)
+    return transformed
+
+
+def _extract_domain(url: str) -> str:
+    """Extract root domain from URL."""
+    try:
+        from urllib.parse import urlparse
+        parsed = urlparse(url)
+        parts = parsed.netloc.split(".")
+        return ".".join(parts[-2:]) if len(parts) >= 2 else parsed.netloc
+    except Exception:
+        return ""
+
+
+def load_to_s3(**context):
+    """
+    Write transformed stories as newline-delimited JSON to S3.
+    Partition layout: s3://{bucket}/{prefix}/year=YYYY/month=MM/day=DD/stories.json
+    """
+    import boto3
+
+    stories: list[dict] = context["task_instance"].xcom_pull(
+        key="transformed", task_ids="transform_stories"
+    )
+
+    run_date: str = context["ds"]
+    year, month, day = run_date.split("-")
+
+    s3_key = f"{S3_PREFIX}/year={year}/month={month}/day={day}/stories.json"
+    ndjson  = "\n".join(json.dumps(s) for s in stories)
+
+    s3 = boto3.client("s3", region_name=AWS_REGION)
+    s3.put_object(
+        Bucket=S3_BUCKET,
+        Key=s3_key,
+        Body=ndjson.encode("utf-8"),
+        ContentType="application/json",
+    )
+
+    manifest = {
+        "run_date":    run_date,
+        "s3_path":     f"s3://{S3_BUCKET}/{s3_key}",
+        "record_count": len(stories),
+        "top_score":   max((s["score"] for s in stories), default=0),
+    }
+
+    log.info("Loaded %d stories → s3://%s/%s", len(stories), S3_BUCKET, s3_key)
+    context["task_instance"].xcom_push(key="manifest", value=manifest)
+
+
+def trigger_glue_crawler(**context):
+    """Start the Glue crawler and wait for completion (up to 15 min)."""
+    import boto3
+    import time
+
+    glue = boto3.client("glue", region_name=AWS_REGION)
+
+    # Start crawler
+    try:
+        glue.start_crawler(Name=GLUE_CRAWLER)
+        log.info("Started Glue crawler: %s", GLUE_CRAWLER)
+    except glue.exceptions.CrawlerRunningException:
+        log.warning("Crawler already running — skipping trigger")
+        return
+
+    # Poll until done
+    deadline = time.time() + 900  # 15-minute timeout
+    while time.time() < deadline:
+        resp    = glue.get_crawler(Name=GLUE_CRAWLER)
+        state   = resp["Crawler"]["State"]
+        log.info("Crawler state: %s", state)
+
+        if state == "READY":
+            last_crawl = resp["Crawler"].get("LastCrawl", {})
+            status     = last_crawl.get("Status", "UNKNOWN")
+            log.info("Crawler finished with status: %s", status)
+            if status == "FAILED":
+                raise RuntimeError(f"Glue crawler failed: {last_crawl.get('ErrorMessage')}")
+            return
+
+        time.sleep(30)
+
+    raise TimeoutError("Glue crawler did not finish within 15 minutes")
+
+
+def write_run_manifest(**context):
+    """Append run metadata to a manifest log in S3 for auditing."""
+    import boto3
+
+    manifest: dict = context["task_instance"].xcom_pull(
+        key="manifest", task_ids="load_to_s3"
+    )
+
+    s3_key = f"manifests/hn_etl_manifest_{context['ds']}.json"
+    s3 = boto3.client("s3", region_name=AWS_REGION)
+    s3.put_object(
+        Bucket=S3_BUCKET,
+        Key=s3_key,
+        Body=json.dumps(manifest, indent=2).encode("utf-8"),
+        ContentType="application/json",
+    )
+    log.info("Manifest written → s3://%s/%s", S3_BUCKET, s3_key)
+
+
+# ---------------------------------------------------------------------------
+# DAG definition
+# ---------------------------------------------------------------------------
+with DAG(
+    dag_id="hn_etl_pipeline",
+    description="Hacker News → S3 → Glue → Athena ETL",
+    default_args=DEFAULT_ARGS,
+    schedule_interval="0 6 * * *",   # Daily 06:00 UTC
+    start_date=days_ago(1),
+    catchup=False,
+    max_active_runs=1,
+    tags=["etl", "hacker-news", "s3", "glue", "data-lake"],
+) as dag:
+
+    start = EmptyOperator(task_id="start")
+    end   = EmptyOperator(task_id="end")
+
+    t_extract_ids = PythonOperator(
+        task_id="extract_story_ids",
+        python_callable=extract_story_ids,
+    )
+
+    t_extract_stories = PythonOperator(
+        task_id="extract_stories",
+        python_callable=extract_stories,
+    )
+
+    t_transform = PythonOperator(
+        task_id="transform_stories",
+        python_callable=transform_stories,
+    )
+
+    t_load = PythonOperator(
+        task_id="load_to_s3",
+        python_callable=load_to_s3,
+    )
+
+    t_glue = PythonOperator(
+        task_id="trigger_glue_crawler",
+        python_callable=trigger_glue_crawler,
+    )
+
+    t_manifest = PythonOperator(
+        task_id="write_run_manifest",
+        python_callable=write_run_manifest,
+    )
+
+    # ---------------------------------------------------------------------------
+    # DAG graph
+    # ---------------------------------------------------------------------------
+    (
+        start
+        >> t_extract_ids
+        >> t_extract_stories
+        >> t_transform
+        >> t_load
+        >> t_glue
+        >> t_manifest
+        >> end
+    )
