@@ -1,24 +1,29 @@
-# Hacker News Data Pipeline
-### End-to-End ETL on AWS · Apache Airflow · S3 Data Lake · Glue · Athena
+# Hacker News ETL Pipeline
 
-> Extracting 200 top stories daily from the Hacker News Firebase API, loading partitioned JSON into an S3 data lake, cataloging schema with AWS Glue, and enabling SQL analytics via Amazon Athena — fully orchestrated with Apache Airflow.
+**End-to-end data engineering pipeline — Apache Airflow · LocalStack S3 · Docker · Python 3.11**
+
+> Extracts the top 200 Hacker News stories daily from the Firebase API, transforms and partitions them into a Hive-style S3 data lake, and renders a custom HTML news reader — fully orchestrated with Apache Airflow running in Docker.
+
+---
 
 ## Architecture
 
-\`\`\`
-HN Firebase API
-       |
-       v
-Apache Airflow DAG (Daily 06:00 UTC)
-extract_ids → extract_stories → transform → load_to_s3 → glue_crawler → manifest
-       |
-       v
-S3 Data Lake (Hive-partitioned NDJSON)
-s3://hn-data-lake/raw/stories/year=YYYY/month=MM/day=DD/
-       |
-       v
-AWS Glue Crawler → Glue Data Catalog → Amazon Athena
-\`\`\`
+```
+Hacker News Firebase API
+        │
+        ▼
+Apache Airflow DAG  (daily @ 06:00 UTC)
+  extract_story_ids → extract_stories → transform → load_to_s3 → glue_crawler → manifest
+        │
+        ▼
+S3 Data Lake  (Hive-partitioned NDJSON)
+  s3://hn-data-lake/raw/stories/year=YYYY/month=MM/day=DD/
+        │
+        ▼
+  today_hn.json → hn_reader_live.html
+```
+
+---
 
 ## Tech Stack
 
@@ -26,58 +31,114 @@ AWS Glue Crawler → Glue Data Catalog → Amazon Athena
 |---|---|
 | Orchestration | Apache Airflow 2.9 |
 | Extraction | Python · requests · ThreadPoolExecutor (20 workers) |
-| Storage | Amazon S3 · Hive-style partitioning |
-| Cataloging | AWS Glue Crawler · Glue Data Catalog |
-| Querying | Amazon Athena · Standard SQL |
-| Infrastructure | Docker · LocalStack |
+| Storage | LocalStack S3 · Hive-style partitioning |
+| Cataloging | AWS Glue Crawler (LocalStack) |
+| Infrastructure | Docker · docker-compose |
+| Output | Custom HTML news reader |
 | Language | Python 3.11 |
 | Testing | pytest |
 
-## Quick Start
-
-\`\`\`bash
-git clone https://github.com/rosalinatorres888/hn-etl-pipeline
-cd hn-etl-pipeline
-docker compose up -d
-open http://localhost:8085   # Airflow UI · admin / admin
-\`\`\`
+---
 
 ## Pipeline — 7 Tasks
 
-\`\`\`
+```
 start
-  └─ extract_story_ids      # GET /topstories.json → 200 IDs
-       └─ extract_stories   # Parallel fetch · 20 workers
-            └─ transform    # Flatten · enrich · normalize
-                 └─ load_to_s3      # NDJSON → S3 partitioned
-                      └─ glue_crawler    # Schema catalog update
-                           └─ manifest   # Audit log
-                                └─ end
-\`\`\`
+└─ extract_story_ids     GET /topstories.json → top 200 IDs
+└─ extract_stories       Parallel fetch · 20 workers · ~10s for 200 stories
+└─ transform_stories     Flatten · enrich · normalize · filter to type=story
+└─ load_to_s3            NDJSON → partitioned S3 data lake
+└─ trigger_glue_crawler  Schema catalog update
+└─ write_run_manifest    Audit JSON → s3://hn-data-lake/manifests/
+└─ end
+```
+
+---
+
+## Quick Start
+
+```bash
+git clone https://github.com/rosalinatorres888/hn-etl-pipeline
+cd hn-etl-pipeline
+
+# Start all services
+docker compose up -d
+
+# Copy DAG into containers (required on macOS due to volume mount behavior)
+docker cp dags/hn_etl_dag.py hn_etl-airflow-scheduler-1:/opt/airflow/dags/hn_etl_dag.py
+docker cp dags/hn_etl_dag.py hn_etl-airflow-webserver-1:/opt/airflow/dags/hn_etl_dag.py
+
+# Create the S3 bucket in LocalStack
+AWS_ACCESS_KEY_ID=test AWS_SECRET_ACCESS_KEY=test \
+  aws --endpoint-url=http://localhost:4566 s3 mb s3://hn-data-lake --region us-east-1
+
+# Open Airflow UI
+open http://localhost:8085   # credentials: airflow / airflow
+
+# Trigger the pipeline
+docker exec hn_etl-airflow-webserver-1 airflow dags trigger hn_etl_pipeline
+```
+
+---
+
+## Generating the HTML Reader
+
+After the pipeline completes, pull today's data from S3 and render the reader:
+
+```bash
+AWS_ACCESS_KEY_ID=test AWS_SECRET_ACCESS_KEY=test \
+  aws --endpoint-url=http://localhost:4566 \
+  s3 cp s3://hn-data-lake/raw/stories/year=YYYY/month=MM/day=DD/stories.json \
+  ~/Downloads/today_hn.json
+
+python3 scripts/refresh_reader.py
+open ~/Downloads/hn_reader_live.html
+```
+
+---
 
 ## Key Engineering Decisions
 
-**Parallel extraction** — ThreadPoolExecutor(max_workers=20) reduces 200 sequential API calls (~200s) to ~10s.
+**Parallel extraction** — `ThreadPoolExecutor(max_workers=20)` reduces 200 sequential API calls (~200s) to ~10s.
 
-**Hive-style S3 partitioning** — enables Athena partition pruning, reducing query cost on large datasets.
+**Hive-style S3 partitioning** — `year=/month=/day=` structure enables partition pruning for efficient querying at scale.
 
 **NDJSON format** — ideal for streaming reads, schema evolution, and Glue crawler inference at the raw layer.
 
-**Run manifests** — every pipeline execution writes audit JSON to s3://hn-data-lake/manifests/ for lineage tracking.
+**Run manifests** — every execution writes an audit JSON to `s3://hn-data-lake/manifests/` for lineage tracking.
 
-## Sample Athena Query
+**LocalStack** — full AWS S3/Glue simulation locally with zero cloud cost during development.
 
-\`\`\`sql
+---
+
+## Repository Structure
+
+```
+hn-etl-pipeline/
+├── dags/
+│   └── hn_etl_dag.py        # 7-task Airflow DAG
+├── scripts/
+│   ├── refresh_reader.py    # Pulls S3 data → renders HTML reader
+│   └── glue_setup.py        # Glue catalog setup
+├── athena/                  # Sample Athena queries
+├── tests/                   # pytest test suite
+├── docker-compose.yml       # Airflow + LocalStack + Postgres
+└── README.md
+```
+
+---
+
+## Sample Query (Athena / LocalStack)
+
+```sql
 SELECT title, domain, by AS author, score, descendants AS comments
-FROM hn_data_lake.stories
-WHERE year = '2026' AND month = '05' AND day = '06'
+FROM hn_stories
+WHERE year = '2026' AND month = '05' AND day = '19'
 ORDER BY score DESC
 LIMIT 10;
-\`\`\`
+```
 
-## Skills Demonstrated
-
-Apache Airflow · AWS S3 · AWS Glue · Amazon Athena · Data Lake Design · ETL Pipeline Architecture · Parallel API Extraction · Schema Evolution · Docker · LocalStack · Python 3.11 · SQL Analytics
+---
 
 ## Author
 
